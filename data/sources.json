@@ -1,0 +1,83 @@
+[
+  {
+    "id": "SRC-01",
+    "ten_nguon": "Hồ sơ Quốc gia đệ trình UNESCO: Hát Xoan Phú Thọ - Di sản văn hóa phi vật thể của nhân loại",
+    "tac_gia_co_quan": "Bộ Văn hóa, Thể thao và Du lịch Việt Nam & UBND tỉnh Phú Thọ",
+    "nam_xuat_ban": "2011 / 2017",
+    "loai_hinh": "Hồ sơ đệ trình Di sản UNESCO",
+    "link": "https://disanvanhoa.gov.vn",
+    "mo_ta": "Hồ sơ khoa học chính thức xác lập giá trị toàn cầu của Hát Xoan Phú Thọ, định danh 4 phường Xoan gốc (An Thái, Phù Đức, Kim Đái, Thét) và 3 chặng diễn xướng cổ truyền gắn với Tín ngưỡng thờ cúng Hùng Vương."
+  },
+  {
+    "id": "SRC-02",
+    "ten_nguon": "UNESCO Representative List: Xoan singing of Phú Thọ Province, Viet Nam",
+    "tac_gia_co_quan": "Ủy ban Liên Chính phủ Công ước 2003 UNESCO",
+    "nam_xuat_ban": "2017",
+    "loai_hinh": "Quyết định & Cơ sở dữ liệu UNESCO",
+    "link": "https://ich.unesco.org/en/RL/xoan-singing-of-phu-tho-province-viet-nam-01260",
+    "mo_ta": "Quyết định ghi danh Hát Xoan Phú Thọ từ Danh sách Cần bảo vệ khẩn cấp (2011) sang Danh sách Di sản văn hóa phi vật thể đại diện của nhân loại (2017) nhờ nỗ lực trao truyền bền bỉ của cộng đồng 4 phường Xoan gốc."
+  },
+  {
+    "id": "SRC-03",
+    "ten_nguon": "Âm nhạc dân gian truyền thống: Dân ca Xoan Phú Thọ",
+    "tac_gia_co_quan": "Viện Âm nhạc Quốc gia Việt Nam",
+    "nam_xuat_ban": "2001 (Tái bản 2012)",
+    "loai_hinh": "Công trình nghiên cứu & Lưu trữ âm thanh",
+    "link": "http://vienamnhac.vn",
+    "mo_ta": "Tuyển tập ghi âm thực địa, ký âm toàn bộ hệ thống 14 quả cách, các bài hát thờ và các làn điệu hát hội giao duyên của các nghệ nhân bậc thầy 4 phường Xoan."
+  },
+  {
+    "id": "SRC-04",
+    "ten_nguon": "Hệ thống tư liệu kiểm kê Di sản Văn hóa phi vật thể Tín ngưỡng thờ cúng Hùng Vương và Hát Xoan",
+    "tac_gia_co_quan": "Cục Di sản Văn hóa - Bộ Văn hóa, Thể thao và Du lịch",
+    "nam_xuat_ban": "2012",
+    "loai_hinh": "Cổng thông tin & Cơ sở dữ liệu quốc gia",
+    "link": "https://disanvanhoa.gov.vn",
+    "mo_ta": "Tư liệu lưu trữ về mối liên hệ hữu cơ giữa hát Xoan và nghi lễ cúng giỗ Tổ Hùng Vương, không gian diễn xướng cửa đình vùng Đất Tổ."
+  },
+  {
+    "id": "SRC-05",
+    "ten_nguon": "Kỷ yếu Bảo tồn và Phát huy giá trị Di sản Hát Xoan gắn với không gian Văn hóa Đền Hùng",
+    "tac_gia_co_quan": "Sở Văn hóa, Thể thao và Du lịch tỉnh Phú Thọ",
+    "nam_xuat_ban": "2018",
+    "loai_hinh": "Kỷ yếu hội thảo khoa học",
+    "link": "https://svhttdl.phutho.gov.vn",
+    "mo_ta": "Tổng hợp nghiên cứu thực tiễn về 4 phường Xoan cổ (An Thái, Phù Đức, Kim Đái, Thét), các di tích đình miếu thờ Vua Hùng và chính sách đãi ngộ người gìn giữ di sản."
+  },
+  {
+    "id": "SRC-06",
+    "ten_nguon": "Báo cáo khảo sát điền dã không gian văn hóa 4 phường Xoan cổ",
+    "tac_gia_co_quan": "Bảo tàng Hùng Vương & Hội Văn nghệ Dân gian Phú Thọ",
+    "nam_xuat_ban": "2015",
+    "loai_hinh": "Báo cáo điều tra thực địa",
+    "link": "https://baotanghungvuong.phutho.gov.vn",
+    "mo_ta": "Ghi chép phong tục kết nghĩa giã bạn giữa các họ Xoan và làng sở tại, tục giữ trùm phường, vai trò của kép và đào trong các chặng hát truyền thống."
+  },
+  {
+    "id": "SRC-07",
+    "ten_nguon": "Ghi chép về Dân ca Xoan và diễn xướng cửa đình vùng Đất Tổ",
+    "tac_gia_co_quan": "GS.TSKH. Tô Ngọc Thanh",
+    "nam_xuat_ban": "1999",
+    "loai_hinh": "Tạp chí Nghiên cứu Văn hóa Nghệ thuật",
+    "link": "https://tapchivanhoanghethuat.vn",
+    "mo_ta": "Phân tích âm nhạc học cấu trúc thang âm, điệu thức, lề lối diễn xướng cửa đình nghiêm ngặt và tính nguyên hợp của nghệ thuật Hát Xoan."
+  },
+  {
+    "id": "SRC-08",
+    "ten_nguon": "Dân ca người Việt: Hệ thống 14 quả cách và lề lối hát thờ",
+    "tac_gia_co_quan": "Nhạc sĩ Tú Ngọc, Viện Âm nhạc",
+    "nam_xuat_ban": "1994",
+    "loai_hinh": "Sách chuyên khảo dân tộc nhạc học",
+    "link": "http://nxbamnhac.vn",
+    "mo_ta": "Khảo cứu chuyên sâu văn bản học và âm luật 14 Quả Cách Xoan - đỉnh cao của thi ca dân gian và tính triết lý nhân sinh thời kỳ văn minh sông Hồng."
+  },
+  {
+    "id": "SRC-09",
+    "ten_nguon": "Đề án Bảo tồn và phát huy giá trị di sản văn hóa phi vật thể Hát Xoan Phú Thọ giai đoạn 2021-2025",
+    "tac_gia_co_quan": "Ủy ban Nhân dân tỉnh Phú Thọ",
+    "nam_xuat_ban": "2021",
+    "loai_hinh": "Đề án quy hoạch bảo tồn cấp tỉnh",
+    "link": "https://phutho.gov.vn",
+    "mo_ta": "Chính sách nhà nước và chương trình hành động quốc gia trao truyền di sản tại các câu lạc bộ, trường học và 4 phường Xoan gốc sau sáp nhập địa giới hành chính."
+  }
+]

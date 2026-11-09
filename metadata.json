@@ -1,0 +1,6 @@
+{
+  "name": "Hát Xoan & Tín ngưỡng thờ Hùng Vương",
+  "description": "Dự án văn hóa xã hội phi lợi nhuận C03 lưu trữ, tra cứu và hỏi đáp di sản Hát Xoan Phú Thọ và Tín ngưỡng thờ cúng Hùng Vương",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
