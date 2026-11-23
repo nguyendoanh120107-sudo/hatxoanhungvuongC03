@@ -26,6 +26,8 @@ export interface SourceItem {
 export interface ServerStatus {
   status: string;
   hasApiKey: boolean;
+  configuredModel?: string;
+  availableModels?: string[];
   totalRecords: number;
   totalSources: number;
   project: string;

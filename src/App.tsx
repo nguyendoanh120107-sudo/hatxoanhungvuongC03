@@ -86,6 +86,9 @@ export default function App() {
           <GeminiQAScreen
             serverStatus={serverStatus}
             onRefreshStatus={fetchStatus}
+            onOpenArchive={() => handleSelectTab('archive')}
+            onSelectRecord={(rec) => setSelectedRecord(rec)}
+            onOpenSources={() => handleSelectTab('sources')}
           />
         )}
 
