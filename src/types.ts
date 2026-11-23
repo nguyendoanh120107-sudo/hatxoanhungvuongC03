@@ -23,6 +23,13 @@ export interface SourceItem {
   mo_ta: string;
 }
 
+export interface QuotaCooldownInfo {
+  scope: 'daily' | 'minute' | 'unknown';
+  retryAfterSeconds: number | null;
+  resetAt: string | null;
+  exhaustedModels: string[];
+}
+
 export interface ServerStatus {
   status: string;
   hasApiKey: boolean;
@@ -30,6 +37,11 @@ export interface ServerStatus {
   availableModels?: string[];
   totalRecords: number;
   totalSources: number;
+  validSourceLinks?: number;
+  cacheEntries?: number;
+  dataVersion?: string;
+  environment?: string;
+  quotaState?: QuotaCooldownInfo | null;
   project: string;
   author: string;
 }

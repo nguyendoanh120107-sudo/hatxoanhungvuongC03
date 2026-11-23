@@ -1,5 +1,6 @@
 import express from 'express';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import dotenv from 'dotenv';
 import { GoogleGenAI, ThinkingLevel } from '@google/genai';
@@ -8,7 +9,9 @@ import {
   HERITAGE_SYSTEM_INSTRUCTION,
   buildGroundedUserPrompt,
 } from './server/heritageData.ts';
-import { retrieveHeritageRecords } from './shared/ragSearch.ts';
+import { normalizeVietnamese, retrieveHeritageRecords } from './shared/ragSearch.ts';
+import type { EnrichedRecord } from './shared/ragSearch.ts';
+import type { QuotaCooldownInfo, SourceItem } from './src/types.ts';
 
 dotenv.config();
 
@@ -24,7 +27,7 @@ app.use(express.json({ limit: '1mb' }));
 // Load & validate database at startup
 const heritageDb = getHeritageDatabase();
 console.log(
-  `[C03 Data] Đã nạp ${heritageDb.records.length} bản ghi và ${heritageDb.sources.length} nguồn (${heritageDb.validLinks} liên kết hợp lệ, ${heritageDb.brokenLinks.length} liên kết lỗi).`
+  `[C03 Data] Đã nạp ${heritageDb.records.length} bản ghi và ${heritageDb.sources.length} nguồn (${heritageDb.validLinks} liên kết hợp lệ, ${heritageDb.brokenLinks.length} liên kết lỗi, phiên bản dữ liệu ${heritageDb.dataVersion}).`
 );
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -37,27 +40,49 @@ const DEPRECATED_MODEL_PREFIXES = [
   'gemini-pro',
 ];
 
-const PREFERRED_MODELS = [
-  'gemini-3.8-flash',
-  'gemini-3.6-flash',
-  'gemini-flash-lite-latest',
-  'gemini-3-flash-preview',
-  'gemini-3.5-flash-lite',
-  'gemini-flash-latest',
-  'gemini-3.1-flash-lite',
-];
+// Models known to require paid billing / higher quota tier (never auto-switch into these without explicit admin config)
+const PAID_ONLY_MODELS = new Set([
+  'gemini-4-carbon',
+  'gemini-4-neon',
+  'gemini-4-argon',
+  'gemini-3.1-pro-preview',
+  'gemini-3.1-pro-preview-customtools',
+  'gemini-pro-latest',
+  'gemini-3-pro-image',
+  'gemini-3-pro-image-preview',
+  'gemini-nano-banana-2.1',
+  'gemini-3.1-flash-lite-image',
+  'gemini-omni-1.2-flash',
+  'genie-4',
+  'lyria-3-clip-preview',
+  'lyria-3-pro-preview',
+]);
 
-let lastWorkingModel: string | null = null;
+// Verified free-tier-capable text models ordered by reliability & quota suitability
+const FREE_TIER_PREFERRED_MODELS = [
+  'gemini-3-flash-preview',
+  'gemini-flash-lite-latest',
+  'gemini-3.5-flash-lite',
+  'gemini-3.1-flash-lite',
+  'gemini-4-hydrogen',
+  'gemini-3.6-flash',
+  'gemini-3.8-flash',
+  'gemini-flash-latest',
+  'gemini-3.5-flash',
+  'gemini-3.7-flash',
+];
 
 function stripModelsPrefix(name: string): string {
   return name.replace(/^models\//, '').trim();
 }
 
-function isCompatibleTextModel(modelName: string): boolean {
+function isCompatibleFreeTierTextModel(modelName: string): boolean {
   const clean = stripModelsPrefix(modelName).toLowerCase();
   if (!clean.includes('gemini')) return false;
   if (DEPRECATED_MODEL_PREFIXES.some((p) => clean.startsWith(p))) return false;
+  if (PAID_ONLY_MODELS.has(clean)) return false;
   if (
+    clean.includes('pro') ||
     clean.includes('image') ||
     clean.includes('nano-banana') ||
     clean.includes('tts') ||
@@ -70,7 +95,9 @@ function isCompatibleTextModel(modelName: string): boolean {
     clean.includes('bisect') ||
     clean.includes('vision') ||
     clean.includes('robotics') ||
-    clean.includes('computer-use')
+    clean.includes('computer-use') ||
+    clean.includes('antigravity') ||
+    clean.includes('deep-research')
   ) {
     return false;
   }
@@ -113,7 +140,7 @@ async function discoverCompatibleModels(ai: GoogleGenAI): Promise<DiscoveredMode
 
   const candidateSet = new Set<string>();
 
-  // 1. Honor explicit GEMINI_MODEL env if configured and accessible (or if list() failed)
+  // 1. Honor explicit GEMINI_MODEL env if configured and accessible (or if list() returned empty)
   if (envModel) {
     if (accessible.length === 0 || accessible.includes(envModel)) {
       candidateSet.add(envModel);
@@ -124,23 +151,16 @@ async function discoverCompatibleModels(ai: GoogleGenAI): Promise<DiscoveredMode
     }
   }
 
-  // 2. Add preferred verified models that exist in accessible list (or fallback to preferred if list empty)
-  for (const pref of PREFERRED_MODELS) {
+  // 2. Add verified non-paid text models that are accessible on this account
+  for (const pref of FREE_TIER_PREFERRED_MODELS) {
     if (accessible.length === 0 || accessible.includes(pref)) {
       candidateSet.add(pref);
     }
   }
 
-  // 3. Add any other accessible compatible flash text models from the account
+  // 3. Add any other accessible compatible free-tier text models
   for (const name of accessible) {
-    if (isCompatibleTextModel(name) && name.includes('flash')) {
-      candidateSet.add(name);
-    }
-  }
-
-  // 4. Add remaining accessible compatible text models (excluding paid-only if possible, or as last resort)
-  for (const name of accessible) {
-    if (isCompatibleTextModel(name)) {
+    if (isCompatibleFreeTierTextModel(name)) {
       candidateSet.add(name);
     }
   }
@@ -154,18 +174,154 @@ async function discoverCompatibleModels(ai: GoogleGenAI): Promise<DiscoveredMode
   return modelsCache;
 }
 
-function extractRetryAfterMs(error: any): number | null {
-  const retryAfterHeader =
+// Track per-model quota cooldowns so exhausted models are not hammered continuously
+interface ModelCooldown {
+  scope: 'daily' | 'minute' | 'unknown';
+  untilMs: number;
+  retryAfterSeconds: number | null;
+  resetAt: string | null;
+  recordedAt: number;
+}
+
+const modelCooldowns = new Map<string, ModelCooldown>();
+const DAILY_COOLDOWN_GUARD_MS = 15 * 60 * 1000;
+
+function getActiveModelCooldown(modelName: string): ModelCooldown | null {
+  const entry = modelCooldowns.get(modelName);
+  if (!entry) return null;
+  if (Date.now() >= entry.untilMs) {
+    modelCooldowns.delete(modelName);
+    return null;
+  }
+  return entry;
+}
+
+function getAggregatedQuotaState(candidateModels: string[]): QuotaCooldownInfo | null {
+  const exhausted: string[] = [];
+  let primaryCooldown: ModelCooldown | null = null;
+
+  for (const m of candidateModels) {
+    const cd = getActiveModelCooldown(m);
+    if (cd) {
+      exhausted.push(m);
+      if (!primaryCooldown) primaryCooldown = cd;
+    }
+  }
+
+  if (exhausted.length === 0 || !primaryCooldown) return null;
+  // Only report global quota exhaustion if all candidate models are cooled down (or at least 1 if pinned)
+  if (exhausted.length < candidateModels.length) return null;
+
+  const remainingSec = primaryCooldown.resetAt
+    ? Math.max(1, Math.ceil((new Date(primaryCooldown.resetAt).getTime() - Date.now()) / 1000))
+    : null;
+
+  return {
+    scope: primaryCooldown.scope,
+    retryAfterSeconds: remainingSec,
+    resetAt: primaryCooldown.resetAt,
+    exhaustedModels: exhausted,
+  };
+}
+
+// Server-side response cache (ONLY successful responses, never errors)
+interface CachedAskEntry {
+  answer: string;
+  grounded: boolean;
+  hasEvidence: boolean;
+  model: string;
+  matchedRecords: EnrichedRecord[];
+  citedSources: SourceItem[];
+  createdAt: string;
+  cachedAtMs: number;
+}
+
+const ANSWER_CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const MAX_CACHE_ENTRIES = 200;
+const answerCache = new Map<string, CachedAskEntry>();
+const inFlightAskRequests = new Map<string, Promise<any>>();
+
+function buildAnswerCacheKey(
+  normalizedQuestion: string,
+  modelScope: string,
+  dataVersion: string,
+  instructionVersion: string
+): string {
+  return crypto
+    .createHash('sha256')
+    .update(`${normalizedQuestion}|${modelScope}|${dataVersion}|${instructionVersion}`)
+    .digest('hex');
+}
+
+function getCachedAnswer(key: string): CachedAskEntry | null {
+  const entry = answerCache.get(key);
+  if (!entry) return null;
+  if (Date.now() - entry.cachedAtMs > ANSWER_CACHE_TTL_MS) {
+    answerCache.delete(key);
+    return null;
+  }
+  // Refresh LRU order
+  answerCache.delete(key);
+  answerCache.set(key, entry);
+  return entry;
+}
+
+function setCachedAnswer(key: string, entry: CachedAskEntry): void {
+  if (answerCache.size >= MAX_CACHE_ENTRIES) {
+    const oldestKey = answerCache.keys().next().value;
+    if (oldestKey) answerCache.delete(oldestKey);
+  }
+  answerCache.set(key, entry);
+}
+
+function parseRetryDelaySeconds(error: any): number | null {
+  const headerVal =
     error?.headers?.get?.('retry-after') ||
     error?.headers?.['retry-after'] ||
     error?.response?.headers?.['retry-after'];
 
-  if (!retryAfterHeader) return null;
-  const seconds = Number(retryAfterHeader);
-  if (!Number.isNaN(seconds) && seconds > 0) {
-    return Math.min(seconds * 1000, 3000);
+  if (headerVal) {
+    const parsedHeader = Number(headerVal);
+    if (!Number.isNaN(parsedHeader) && parsedHeader > 0) {
+      return Math.ceil(parsedHeader);
+    }
+  }
+
+  const rawText = `${String(error?.message || '')} ${JSON.stringify(error?.details || '')}`;
+  const retryDelayMatch = rawText.match(/retryDelay["']?\s*[:=]\s*["']?(\d+(?:\.\d+)?)s/i);
+  if (retryDelayMatch) {
+    return Math.ceil(Number(retryDelayMatch[1]));
+  }
+  const pleaseRetryMatch = rawText.match(/retry in\s+(\d+(?:\.\d+)?)\s*s/i);
+  if (pleaseRetryMatch) {
+    return Math.ceil(Number(pleaseRetryMatch[1]));
   }
   return null;
+}
+
+function detectQuotaScope(rawMsg: string, retryAfterSeconds: number | null): 'daily' | 'minute' | 'unknown' {
+  const upper = rawMsg.toUpperCase();
+  if (
+    upper.includes('PERDAY') ||
+    upper.includes('PER_DAY') ||
+    upper.includes('FREE_TIER_REQUESTS') ||
+    upper.includes('GENERATEREQUESTSPERDAY') ||
+    upper.includes('REQUESTS_PER_DAY') ||
+    upper.includes('LIMIT: 20') ||
+    (retryAfterSeconds !== null && retryAfterSeconds > 3600)
+  ) {
+    return 'daily';
+  }
+  if (
+    upper.includes('PERMINUTE') ||
+    upper.includes('PER_MINUTE') ||
+    upper.includes('RPM') ||
+    upper.includes('TPM') ||
+    (retryAfterSeconds !== null && retryAfterSeconds <= 120)
+  ) {
+    return 'minute';
+  }
+  return 'unknown';
 }
 
 interface ClassifiedError {
@@ -174,14 +330,19 @@ interface ClassifiedError {
   userMessage: string;
   retryable: boolean;
   switchModel: boolean;
-  retryAfterMs: number | null;
+  quotaScope?: 'daily' | 'minute' | 'unknown';
+  retryAfterSeconds: number | null;
+  resetAt: string | null;
 }
+
+const QUOTA_EXHAUSTED_VI_MSG =
+  'Trợ lý Gemini đã sử dụng hết hạn mức API của dự án. Bạn vẫn có thể tra cứu 21 bản ghi tư liệu và 9 nguồn trực tiếp. Vui lòng thử lại khi hạn mức được khôi phục.';
 
 function classifyGeminiError(error: any): ClassifiedError {
   const rawMsg = String(error?.message || error || '');
   const status = Number(error?.status || error?.code || 0);
   const upperMsg = rawMsg.toUpperCase();
-  const retryAfterMs = extractRetryAfterMs(error);
+  const retryAfterSeconds = parseRetryDelaySeconds(error);
 
   if (
     status === 401 ||
@@ -196,10 +357,11 @@ function classifyGeminiError(error: any): ClassifiedError {
       statusCode: status === 401 ? 401 : 403,
       errorCode: 'AUTH_ERROR',
       userMessage:
-        'Lỗi xác thực API key hoặc quyền truy cập Gemini (401/403). Vui lòng kiểm tra lại GEMINI_API_KEY trong phần cấu hình Secrets.',
+        'Không có quyền truy cập hoặc khóa API Gemini không hợp lệ (401/403). Vui lòng kiểm tra cấu hình Secrets trên máy chủ.',
       retryable: false,
       switchModel: false,
-      retryAfterMs: null,
+      retryAfterSeconds: null,
+      resetAt: null,
     };
   }
 
@@ -210,8 +372,9 @@ function classifyGeminiError(error: any): ClassifiedError {
       userMessage:
         'Yêu cầu gửi tới mô hình AI không hợp lệ (400). Vui lòng thử diễn đạt lại câu hỏi.',
       retryable: false,
-      switchModel: true,
-      retryAfterMs: null,
+      switchModel: false,
+      retryAfterSeconds: null,
+      resetAt: null,
     };
   }
 
@@ -224,10 +387,11 @@ function classifyGeminiError(error: any): ClassifiedError {
       statusCode: 404,
       errorCode: 'MODEL_NOT_FOUND',
       userMessage:
-        'Endpoint hoặc mô hình Gemini được cấu hình không tồn tại hoặc không hỗ trợ tài khoản này (404).',
+        'Mô hình Gemini được chọn không tồn tại hoặc không hỗ trợ trên tài khoản này (404).',
       retryable: false,
       switchModel: true,
-      retryAfterMs: null,
+      retryAfterSeconds: null,
+      resetAt: null,
     };
   }
 
@@ -238,14 +402,22 @@ function classifyGeminiError(error: any): ClassifiedError {
     upperMsg.includes('QUOTA') ||
     upperMsg.includes('RATE_LIMIT')
   ) {
+    const quotaScope = detectQuotaScope(rawMsg, retryAfterSeconds);
+    const resetAt =
+      retryAfterSeconds !== null
+        ? new Date(Date.now() + retryAfterSeconds * 1000).toISOString()
+        : null;
+
     return {
       statusCode: 429,
-      errorCode: 'RATE_LIMITED',
-      userMessage:
-        'Hệ thống đã vượt giới hạn lượt truy vấn Gemini API (429). Vui lòng đợi ít giây rồi thử lại.',
-      retryable: true,
+      errorCode: 'RESOURCE_EXHAUSTED',
+      userMessage: QUOTA_EXHAUSTED_VI_MSG,
+      // Never auto-retry daily quota errors; allow controlled single backoff ONLY for short per-minute limits
+      retryable: quotaScope === 'minute' && retryAfterSeconds !== null && retryAfterSeconds <= 3,
       switchModel: true,
-      retryAfterMs,
+      quotaScope,
+      retryAfterSeconds,
+      resetAt,
     };
   }
 
@@ -256,14 +428,19 @@ function classifyGeminiError(error: any): ClassifiedError {
     upperMsg.includes('HIGH DEMAND') ||
     upperMsg.includes('OVERLOADED')
   ) {
+    const resetAt =
+      retryAfterSeconds !== null
+        ? new Date(Date.now() + retryAfterSeconds * 1000).toISOString()
+        : null;
     return {
       statusCode: 503,
       errorCode: 'SERVICE_UNAVAILABLE',
       userMessage:
-        'Dịch vụ AI tạm thời không khả dụng do lượng truy cập cao (503). Dữ liệu tư liệu vẫn có thể tra cứu trực tiếp.',
+        'Dịch vụ Gemini tạm thời không khả dụng do quá tải (503). Bạn vẫn có thể tra cứu trực tiếp 21 bản ghi bên dưới.',
       retryable: true,
       switchModel: true,
-      retryAfterMs,
+      retryAfterSeconds,
+      resetAt,
     };
   }
 
@@ -278,10 +455,11 @@ function classifyGeminiError(error: any): ClassifiedError {
       statusCode: 504,
       errorCode: 'GATEWAY_TIMEOUT',
       userMessage:
-        'Yêu cầu tới trợ lý Gemini vượt quá thời gian chờ (Timeout). Vui lòng nhấn thử lại.',
-      retryable: true,
+        'Yêu cầu tới trợ lý Gemini vượt quá thời gian chờ (Timeout). Bạn có thể sử dụng kết quả tra cứu trực tiếp bên dưới.',
+      retryable: false,
       switchModel: true,
-      retryAfterMs: null,
+      retryAfterSeconds: null,
+      resetAt: null,
     };
   }
 
@@ -297,10 +475,11 @@ function classifyGeminiError(error: any): ClassifiedError {
       statusCode: 502,
       errorCode: 'BAD_GATEWAY',
       userMessage:
-        'Lỗi kết nối tới dịch vụ Gemini phía sau (502). Vui lòng thử lại sau vài giây.',
-      retryable: true,
+        'Lỗi kết nối tới dịch vụ Gemini (502). Dữ liệu 21 bản ghi và 9 nguồn vẫn tra cứu được trực tiếp.',
+      retryable: false,
       switchModel: true,
-      retryAfterMs: null,
+      retryAfterSeconds: null,
+      resetAt: null,
     };
   }
 
@@ -308,10 +487,11 @@ function classifyGeminiError(error: any): ClassifiedError {
     statusCode: 500,
     errorCode: 'INTERNAL_SERVER_ERROR',
     userMessage:
-      'Máy chủ gặp sự cố khi xử lý yêu cầu Gemini (500). Dữ liệu tư liệu vẫn có thể tra cứu trực tiếp.',
-    retryable: true,
+      'Máy chủ gặp sự cố khi xử lý yêu cầu Gemini (500). Bạn vẫn có thể tra cứu trực tiếp 21 bản ghi tư liệu.',
+    retryable: false,
     switchModel: true,
-    retryAfterMs: null,
+    retryAfterSeconds: null,
+    resetAt: null,
   };
 }
 
@@ -331,9 +511,9 @@ function createGeminiClient(apiKey: string): GoogleGenAI {
 app.get('/api/status', async (_req, res) => {
   const db = getHeritageDatabase();
   const hasApiKey = Boolean(process.env.GEMINI_API_KEY);
-  const configuredModel = process.env.GEMINI_MODEL
+  const envConfigured = process.env.GEMINI_MODEL
     ? stripModelsPrefix(process.env.GEMINI_MODEL)
-    : 'gemini-3.8-flash';
+    : '';
 
   let accessibleModels: string[] = [];
   if (hasApiKey) {
@@ -346,6 +526,11 @@ app.get('/api/status', async (_req, res) => {
     }
   }
 
+  const configuredModel =
+    envConfigured || accessibleModels[0] || FREE_TIER_PREFERRED_MODELS[0];
+  const quotaState =
+    accessibleModels.length > 0 ? getAggregatedQuotaState(accessibleModels) : null;
+
   res.json({
     status: 'ok',
     hasApiKey,
@@ -354,6 +539,10 @@ app.get('/api/status', async (_req, res) => {
     totalRecords: db.records.length,
     totalSources: db.sources.length,
     validSourceLinks: db.validLinks,
+    cacheEntries: answerCache.size,
+    dataVersion: db.dataVersion,
+    environment: isProduction ? 'production' : 'preview',
+    quotaState,
     project: 'C03 - Hát Xoan và tín ngưỡng thờ Hùng Vương',
     author: 'Nguyễn Ngọc Doanh - MSV TH04122 (Nhóm 2 - IMTA TECH x FPT Polytechnic)',
   });
@@ -375,17 +564,20 @@ app.get('/api/models', async (req, res) => {
     const discovered = await discoverCompatibleModels(ai);
     const configured = process.env.GEMINI_MODEL
       ? stripModelsPrefix(process.env.GEMINI_MODEL)
-      : 'gemini-4-hydrogen';
+      : discovered.candidateTextModels[0] || FREE_TIER_PREFERRED_MODELS[0];
 
-    let probeResults: Array<{ model: string; ok: boolean; status?: number; error?: string }> | undefined;
+    let probeResults:
+      | Array<{ model: string; ok: boolean; status?: number; error?: string }>
+      | undefined;
+
     if (req.query.probe === '1') {
-      const toProbe = discovered.candidateTextModels.slice(0, 22);
+      const toProbe = discovered.candidateTextModels.slice(0, 12);
       probeResults = await Promise.all(
         toProbe.map(async (m) => {
           try {
             const r = await ai.models.generateContent({
               model: m,
-              contents: 'Trả lời 1 từ: OK',
+              contents: 'OK',
             });
             return { model: m, ok: Boolean(r.text) };
           } catch (err: any) {
@@ -448,7 +640,7 @@ app.post('/api/search', (req, res) => {
       sources: retrieval.sources,
     });
   } catch (err: any) {
-    console.error('[Search /api/search] Lỗi:', err);
+    console.error('[Search /api/search] Lỗi:', err?.message || err);
     return res.status(500).json({
       status: 'error',
       error: 'SEARCH_ERROR',
@@ -459,7 +651,7 @@ app.post('/api/search', (req, res) => {
 
 app.post('/api/ask', async (req, res) => {
   try {
-    const { question } = req.body || {};
+    const { question, selectedModel, bypassCooldown } = req.body || {};
     if (!question || typeof question !== 'string' || !question.trim()) {
       return res.status(400).json({
         status: 'error',
@@ -469,25 +661,42 @@ app.post('/api/ask', async (req, res) => {
     }
 
     const cleanQuestion = question.normalize('NFC').trim();
+    const normalizedQuestion = normalizeVietnamese(cleanQuestion);
     const db = getHeritageDatabase();
 
-    // Phase 1: Always run grounded local retrieval against all 21 records and 9 sources
+    // Phase 1: Always run grounded local retrieval BEFORE touching Gemini (saves API calls)
     const retrieval = retrieveHeritageRecords(cleanQuestion, db.records, db.sources);
 
-    // Optional mock error header for automated verification (TEST 7) in non-production
+    // Optional mock error header for automated verification (TEST 2 / TEST 7) in non-production
     const mockErrorHeader = !isProduction
       ? String(req.headers['x-mock-gemini-error'] || '')
       : '';
-    if (mockErrorHeader === '503' || mockErrorHeader === '429' || mockErrorHeader === '500') {
-      const code = Number(mockErrorHeader);
-      const mockErr = classifyGeminiError({ status: code, message: `Mock ${code} error` });
+    if (
+      mockErrorHeader === '429' ||
+      mockErrorHeader === '429-daily' ||
+      mockErrorHeader === '429-minute' ||
+      mockErrorHeader === '503' ||
+      mockErrorHeader === '500'
+    ) {
+      const code = mockErrorHeader.startsWith('429') ? 429 : Number(mockErrorHeader);
+      const mockMsg =
+        mockErrorHeader === '429-minute'
+          ? '429 RESOURCE_EXHAUSTED PerMinute retry in 25s'
+          : mockErrorHeader.startsWith('429')
+          ? '429 RESOURCE_EXHAUSTED quota exceeded for generativelanguage.googleapis.com/generate_content_free_tier_requests PerDay limit: 20'
+          : `Mock ${code} error`;
+      const mockErr = classifyGeminiError({ status: code, message: mockMsg });
       return res.status(mockErr.statusCode).json({
         status: 'error',
         error: mockErr.errorCode,
         httpStatus: mockErr.statusCode,
+        quotaScope: mockErr.quotaScope || null,
+        retryAfterSeconds: mockErr.retryAfterSeconds,
+        resetAt: mockErr.resetAt,
         message: mockErr.userMessage,
         fallbackRecords: retrieval.records,
         fallbackSources: retrieval.sources,
+        needsDeepReasoning: retrieval.intent.needsDeepReasoning,
         matchedCount: retrieval.records.length,
       });
     }
@@ -499,135 +708,266 @@ app.post('/api/ask', async (req, res) => {
         error: 'MISSING_API_KEY',
         httpStatus: 503,
         message:
-          'Máy chủ chưa được cấu hình GEMINI_API_KEY trong hệ thống Secrets. Vui lòng cấu hình khóa để kích hoạt trợ lý Gemini.',
+          'Máy chủ chưa được cấu hình GEMINI_API_KEY trong hệ thống Secrets. Bạn vẫn có thể tra cứu trực tiếp 21 bản ghi.',
         fallbackRecords: retrieval.records,
         fallbackSources: retrieval.sources,
+        needsDeepReasoning: retrieval.intent.needsDeepReasoning,
         matchedCount: retrieval.records.length,
       });
     }
 
     const ai = createGeminiClient(apiKey);
     const discovered = await discoverCompatibleModels(ai);
-    const baseCandidates =
-      discovered.candidateTextModels.length > 0
-        ? discovered.candidateTextModels
-        : PREFERRED_MODELS;
 
-    // Prioritize lastWorkingModel (unless GEMINI_MODEL is explicitly pinned first)
-    const candidateModels =
-      lastWorkingModel && baseCandidates.includes(lastWorkingModel) && !process.env.GEMINI_MODEL
-        ? [lastWorkingModel, ...baseCandidates.filter((m) => m !== lastWorkingModel)]
-        : baseCandidates;
+    const envPinnedModel = process.env.GEMINI_MODEL
+      ? stripModelsPrefix(process.env.GEMINI_MODEL)
+      : '';
+    const clientSelectedModel =
+      typeof selectedModel === 'string' && selectedModel.trim()
+        ? stripModelsPrefix(selectedModel)
+        : '';
 
-    const userPrompt = buildGroundedUserPrompt(cleanQuestion, retrieval, db);
+    // Validate client-selected model strictly against discovered accessible free-tier candidates
+    const validatedSelectedModel =
+      clientSelectedModel && discovered.candidateTextModels.includes(clientSelectedModel)
+        ? clientSelectedModel
+        : '';
 
-    let lastClassified: ClassifiedError | null = null;
+    const pinnedModel = validatedSelectedModel || envPinnedModel;
+    const modelScope = pinnedModel || 'auto-verified-free';
 
-    // Try up to 8 compatible text models so overloaded models are bypassed cleanly
-    const modelsToTry = candidateModels.slice(0, 8);
+    // Phase 2: Check server-side response cache BEFORE quota cooldown or Gemini call (TEST 5)
+    const cacheKey = buildAnswerCacheKey(
+      normalizedQuestion,
+      modelScope,
+      db.dataVersion,
+      db.instructionVersion
+    );
+    const cachedHit = getCachedAnswer(cacheKey);
+    if (cachedHit) {
+      return res.json({
+        status: 'success',
+        answer: cachedHit.answer,
+        grounded: cachedHit.grounded,
+        hasEvidence: cachedHit.hasEvidence,
+        model: cachedHit.model,
+        cached: true,
+        matchedRecords: cachedHit.matchedRecords,
+        citedSources: cachedHit.citedSources,
+        timestamp: cachedHit.createdAt,
+      });
+    }
 
-    for (let mIdx = 0; mIdx < modelsToTry.length; mIdx++) {
-      const modelName = modelsToTry[mIdx];
-      const maxAttempts = modelsToTry.length > 1 ? 1 : 2;
-      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-        try {
-          const config: Record<string, any> = {
-            systemInstruction: HERITAGE_SYSTEM_INSTRUCTION,
-          };
+    // Build candidate list: if a model is pinned by admin/env, respect that pin instead of unapproved switches
+    const candidateModels = pinnedModel
+      ? [pinnedModel]
+      : discovered.candidateTextModels.length > 0
+      ? discovered.candidateTextModels
+      : FREE_TIER_PREFERRED_MODELS;
 
-          // Apply ThinkingLevel.LOW only on Gemini 3 / 4 models that support it
-          if (modelName.startsWith('gemini-3.8') || modelName.startsWith('gemini-4')) {
-            config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
-          }
-
-          const response = await ai.models.generateContent({
-            model: modelName,
-            contents: userPrompt,
-            config,
-          });
-
-          const answerText = (response.text || '').trim();
-          if (!answerText) {
-            throw new Error('Empty response from Gemini');
-          }
-
-          lastWorkingModel = modelName;
-
-          return res.json({
-            status: 'success',
-            answer: answerText,
-            grounded: true,
-            hasEvidence: retrieval.records.length > 0,
-            model: modelName,
-            matchedRecords: retrieval.records,
-            citedSources: retrieval.sources,
-            timestamp: new Date().toISOString(),
-          });
-        } catch (err: any) {
-          const classified = classifyGeminiError(err);
-          // Do not overwrite an informative 503/429 with a fallback model's 404
-          if (!lastClassified || classified.statusCode !== 404) {
-            lastClassified = classified;
-          }
-          console.warn(
-            `[Gemini /api/ask] Model=${modelName} Attempt=${attempt}/${maxAttempts} Code=${classified.errorCode} Status=${classified.statusCode}`
-          );
-
-          // Never retry auth errors (401/403)
-          if (!classified.retryable && !classified.switchModel) {
-            return res.status(classified.statusCode).json({
-              status: 'error',
-              error: classified.errorCode,
-              httpStatus: classified.statusCode,
-              message: classified.userMessage,
-              fallbackRecords: retrieval.records,
-              fallbackSources: retrieval.sources,
-              matchedCount: retrieval.records.length,
-            });
-          }
-
-          if (classified.retryable && attempt < maxAttempts) {
-            const backoffMs =
-              classified.retryAfterMs ??
-              450 * Math.pow(2, attempt - 1) + Math.floor(Math.random() * 200);
-            await sleep(backoffMs);
-            continue;
-          }
-
-          // Clear cached working model if it just failed
-          if (lastWorkingModel === modelName) {
-            lastWorkingModel = null;
-          }
-
-          // Switch to next model candidate
-          break;
-        }
+    // Clear cooldowns ONLY on explicit manual retry button ("Thử lại khi Gemini khả dụng")
+    if (bypassCooldown === true) {
+      for (const m of candidateModels) {
+        modelCooldowns.delete(m);
       }
     }
 
-    const finalErr = lastClassified ?? {
-      statusCode: 503,
-      errorCode: 'SERVICE_UNAVAILABLE',
-      userMessage: 'Dịch vụ AI tạm thời không khả dụng. Dữ liệu tư liệu vẫn có thể tra cứu trực tiếp.',
-    };
+    // Check cooldowns so exhausted daily quota is NEVER hammered repeatedly
+    const nonCooledModels = candidateModels.filter((m) => !getActiveModelCooldown(m));
+    if (nonCooledModels.length === 0) {
+      const existingCooldown = getActiveModelCooldown(candidateModels[0]);
+      const retryAfterSeconds = existingCooldown?.resetAt
+        ? Math.max(1, Math.ceil((new Date(existingCooldown.resetAt).getTime() - Date.now()) / 1000))
+        : existingCooldown?.retryAfterSeconds ?? null;
 
-    // All model attempts exhausted — return structured API error + real local search fallback
-    return res.status(finalErr.statusCode).json({
-      status: 'error',
-      error: finalErr.errorCode,
-      httpStatus: finalErr.statusCode,
-      message: finalErr.userMessage,
-      fallbackRecords: retrieval.records,
-      fallbackSources: retrieval.sources,
-      matchedCount: retrieval.records.length,
-    });
+      return res.status(429).json({
+        status: 'error',
+        error: 'RESOURCE_EXHAUSTED',
+        httpStatus: 429,
+        quotaScope: existingCooldown?.scope || 'daily',
+        retryAfterSeconds,
+        resetAt: existingCooldown?.resetAt || null,
+        message: QUOTA_EXHAUSTED_VI_MSG,
+        fallbackRecords: retrieval.records,
+        fallbackSources: retrieval.sources,
+        needsDeepReasoning: retrieval.intent.needsDeepReasoning,
+        matchedCount: retrieval.records.length,
+      });
+    }
+
+    // Phase 3: Coalesce duplicate in-flight requests for the exact same normalized question & model scope (TEST 6)
+    const existingFlight = inFlightAskRequests.get(cacheKey);
+    if (existingFlight) {
+      const sharedResult = await existingFlight;
+      return res.status(sharedResult.httpStatus || 200).json(sharedResult.payload);
+    }
+
+    const askPromise = (async () => {
+      const userPrompt = buildGroundedUserPrompt(cleanQuestion, retrieval, db);
+      let lastClassified: ClassifiedError | null = null;
+
+      // Try up to 3 verified non-cooled models (no infinite loops, no hammering exhausted models)
+      const modelsToTry = nonCooledModels.slice(0, 3);
+
+      for (const modelName of modelsToTry) {
+        for (let attempt = 1; attempt <= 2; attempt++) {
+          try {
+            const config: Record<string, any> = {
+              systemInstruction: HERITAGE_SYSTEM_INSTRUCTION,
+            };
+
+            if (modelName.startsWith('gemini-3.8') || modelName.startsWith('gemini-4')) {
+              config.thinkingConfig = { thinkingLevel: ThinkingLevel.LOW };
+            }
+
+            const response = await ai.models.generateContent({
+              model: modelName,
+              contents: userPrompt,
+              config,
+            });
+
+            const answerText = (response.text || '').trim();
+            if (!answerText) {
+              throw new Error('Empty response from Gemini');
+            }
+
+            const createdAt = new Date().toISOString();
+            setCachedAnswer(cacheKey, {
+              answer: answerText,
+              grounded: true,
+              hasEvidence: retrieval.records.length > 0,
+              model: modelName,
+              matchedRecords: retrieval.records,
+              citedSources: retrieval.sources,
+              createdAt,
+              cachedAtMs: Date.now(),
+            });
+
+            return {
+              httpStatus: 200,
+              payload: {
+                status: 'success',
+                answer: answerText,
+                grounded: true,
+                hasEvidence: retrieval.records.length > 0,
+                model: modelName,
+                cached: false,
+                matchedRecords: retrieval.records,
+                citedSources: retrieval.sources,
+                timestamp: createdAt,
+              },
+            };
+          } catch (err: any) {
+            const classified = classifyGeminiError(err);
+            if (!lastClassified || classified.statusCode !== 404) {
+              lastClassified = classified;
+            }
+            console.warn(
+              `[Gemini /api/ask] Model=${modelName} Attempt=${attempt} Code=${classified.errorCode} Status=${classified.statusCode}`
+            );
+
+            // Record 429 quota cooldown for this model so it is NOT retried repeatedly
+            if (classified.statusCode === 429) {
+              const scope = classified.quotaScope || 'unknown';
+              if (scope === 'minute' && classified.retryAfterSeconds && classified.retryAfterSeconds <= 3 && attempt === 1) {
+                await sleep(classified.retryAfterSeconds * 1000);
+                continue;
+              }
+              const cooldownMs =
+                classified.retryAfterSeconds !== null
+                  ? classified.retryAfterSeconds * 1000
+                  : scope === 'minute'
+                  ? 30 * 1000
+                  : DAILY_COOLDOWN_GUARD_MS;
+
+              modelCooldowns.set(modelName, {
+                scope,
+                untilMs: Date.now() + cooldownMs,
+                retryAfterSeconds: classified.retryAfterSeconds,
+                resetAt: classified.resetAt,
+                recordedAt: Date.now(),
+              });
+              break; // Move to next verified model (if unpinned) or stop immediately (if pinned)
+            }
+
+            // Never retry 401/403/400 auth/bad-request
+            if (!classified.retryable) {
+              if (!classified.switchModel) {
+                return {
+                  httpStatus: classified.statusCode,
+                  payload: {
+                    status: 'error',
+                    error: classified.errorCode,
+                    httpStatus: classified.statusCode,
+                    message: classified.userMessage,
+                    fallbackRecords: retrieval.records,
+                    fallbackSources: retrieval.sources,
+                    needsDeepReasoning: retrieval.intent.needsDeepReasoning,
+                    matchedCount: retrieval.records.length,
+                  },
+                };
+              }
+              break;
+            }
+
+            // Single controlled retry only on 503 with bounded backoff
+            if (attempt === 1) {
+              const waitMs =
+                classified.retryAfterSeconds !== null
+                  ? Math.min(classified.retryAfterSeconds * 1000, 2500)
+                  : 700;
+              await sleep(waitMs);
+              continue;
+            }
+          }
+        }
+      }
+
+      const finalErr = lastClassified ?? {
+        statusCode: 503,
+        errorCode: 'SERVICE_UNAVAILABLE',
+        userMessage:
+          'Dịch vụ Gemini tạm thời không khả dụng. Bạn vẫn có thể tra cứu trực tiếp 21 bản ghi bên dưới.',
+        quotaScope: undefined,
+        retryAfterSeconds: null,
+        resetAt: null,
+      };
+
+      return {
+        httpStatus: finalErr.statusCode,
+        payload: {
+          status: 'error',
+          error: finalErr.errorCode,
+          httpStatus: finalErr.statusCode,
+          quotaScope: finalErr.quotaScope || null,
+          retryAfterSeconds: finalErr.retryAfterSeconds,
+          resetAt: finalErr.resetAt,
+          message: finalErr.userMessage,
+          fallbackRecords: retrieval.records,
+          fallbackSources: retrieval.sources,
+          needsDeepReasoning: retrieval.intent.needsDeepReasoning,
+          matchedCount: retrieval.records.length,
+        },
+      };
+    })();
+
+    inFlightAskRequests.set(cacheKey, askPromise);
+    try {
+      const result = await askPromise;
+      return res.status(result.httpStatus).json(result.payload);
+    } finally {
+      inFlightAskRequests.delete(cacheKey);
+    }
   } catch (error: any) {
-    console.error('[Gemini /api/ask] Lỗi không mong muốn:', error);
+    console.error('[Gemini /api/ask] Lỗi không mong muốn:', error?.message || error);
     const classified = classifyGeminiError(error);
     return res.status(classified.statusCode).json({
       status: 'error',
       error: classified.errorCode,
       httpStatus: classified.statusCode,
+      quotaScope: classified.quotaScope || null,
+      retryAfterSeconds: classified.retryAfterSeconds,
+      resetAt: classified.resetAt,
       message: classified.userMessage,
       fallbackRecords: [],
       fallbackSources: [],

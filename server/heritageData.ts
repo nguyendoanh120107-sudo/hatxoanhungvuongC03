@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import { fileURLToPath } from 'url';
 import type { RecordItem, SourceItem } from '../src/types.ts';
 import type { EnrichedRecord, RetrievalResult } from '../shared/ragSearch.ts';
@@ -14,6 +15,8 @@ export interface LoadedHeritageDatabase {
   sourcesPath: string;
   validLinks: number;
   brokenLinks: Array<{ recordId: string; sourceId: string }>;
+  dataVersion: string;
+  instructionVersion: string;
 }
 
 function resolveDataFile(filename: string): string {
@@ -105,6 +108,14 @@ export function getHeritageDatabase(): LoadedHeritageDatabase {
     }
   }
 
+  const dataRawStr = JSON.stringify({ records, sources });
+  const dataVersion = crypto.createHash('sha256').update(dataRawStr).digest('hex').slice(0, 12);
+  const instructionVersion = crypto
+    .createHash('sha256')
+    .update(HERITAGE_SYSTEM_INSTRUCTION)
+    .digest('hex')
+    .slice(0, 12);
+
   cachedDatabase = {
     records,
     sources,
@@ -112,6 +123,8 @@ export function getHeritageDatabase(): LoadedHeritageDatabase {
     sourcesPath,
     validLinks,
     brokenLinks,
+    dataVersion,
+    instructionVersion,
   };
 
   return cachedDatabase;
@@ -136,7 +149,7 @@ Khi trả lời:
 Quy tắc chuẩn mực dữ liệu bắt buộc:
 - Khi nêu địa bàn bản ghi, luôn giữ đủ hai trường địa danh: "Phường Vân Phú, tỉnh Phú Thọ" (hiện nay) và "Xã Phượng Lâu và xã Kim Đức, thành phố Việt Trì, tỉnh Phú Thọ (trước 01/7/2025)".
 - Khi nêu cộng đồng thực hành, ghi rõ: "Cộng đồng 4 phường Xoan gốc: An Thái, Phù Đức, Kim Đái (Kim Đới), Thét". Không tự gán tên bài cụ thể cho riêng một phường nếu nguồn chưa chứng minh.
-- Trả lời bằng tiếng Việt tự nhiên, có dấu, mạch lạc và dễ hiểu. Không xuất mã JSON thô.`;
+- Trả lời bằng tiếng Việt tự nhiên, có dấu, súc tích và mạch lạc (khoảng 120–350 từ cho câu hỏi đơn lẻ; liệt kê đầy đủ khi hỏi hệ thống nhiều bài). Không xuất mã JSON thô.`;
 
 function formatRecordForPrompt(rec: EnrichedRecord): string {
   const sourceLines = rec.sources.length
@@ -190,6 +203,12 @@ YÊU CẦU TRẢ LỜI:
 - Tuyệt đối không tự bịa thông tin hay lời hát.`;
   }
 
+  const includeIndex =
+    retrieval.intent.isSynthesis ||
+    retrieval.intent.isAllQuaCach ||
+    retrieval.intent.isAllHatTho ||
+    retrieval.intent.isAllHatHoi;
+
   const detailedContext = retrieval.records.map(formatRecordForPrompt).join('\n\n---\n\n');
 
   return `CÂU HỎI CỦA NGƯỜI DÙNG:
@@ -197,14 +216,15 @@ YÊU CẦU TRẢ LỜI:
 
 TƯ LIỆU TRÍCH XUẤT LIÊN QUAN (${retrieval.records.length}/21 bản ghi):
 
-${detailedContext}
-
-MỤC LỤC TOÀN BỘ 21 BẢN GHI TRONG KHO (để kiểm tra tính đầy đủ khi tổng hợp):
-${indexSummary}
+${detailedContext}${
+    includeIndex
+      ? `\n\nMỤC LỤC TOÀN BỘ 21 BẢN GHI TRONG KHO (để kiểm tra tính đầy đủ khi tổng hợp):\n${indexSummary}`
+      : ''
+  }
 
 YÊU CẦU TRẢ LỜI:
-- Trả lời trực tiếp, mạch lạc bằng tiếng Việt có dấu dựa trên các bản ghi trên.
-- Trích dẫn cụ thể mã bản ghi [XOAN-XX] và mã nguồn [SRC-XX] đã dùng.
+- Trả lời trực tiếp, súc tích, mạch lạc bằng tiếng Việt có dấu dựa trên các bản ghi trên.
+- Trích dẫn cụ thể tên bài, mã bản ghi [XOAN-XX] và mã nguồn [SRC-XX] đã dùng.
 - Nếu là câu hỏi tổng hợp (như Hệ thống 14 Quả Cách), liệt kê đầy đủ các bản ghi Quả Cách có trong kho và đối chiếu rõ.
-- Nếu câu hỏi nhắc tới khía cạnh chưa có trong hồ sơ (ví dụ: niên đại chính xác từng câu chữ hoặc thông tin ngoài phạm vi), chỉ rõ phần nào có bằng chứng trong hồ sơ và phần nào chưa đủ tư liệu.`;
+- Nếu câu hỏi nhắc tới khía cạnh chưa có trong hồ sơ, chỉ rõ phần nào có bằng chứng và phần nào chưa đủ tư liệu.`;
 }

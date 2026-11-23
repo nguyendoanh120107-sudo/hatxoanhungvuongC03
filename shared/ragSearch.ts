@@ -19,6 +19,7 @@ export interface RetrievalResult {
     isAllHatHoi: boolean;
     isSynthesis: boolean;
     isCommunityOrLocation: boolean;
+    needsDeepReasoning: boolean;
   };
   matches: SearchMatch[];
   records: EnrichedRecord[];
@@ -164,6 +165,17 @@ export function retrieveHeritageRecords(
     normQuery.includes('21 ban ghi') ||
     normQuery.includes('hai mot');
 
+  const needsDeepReasoning =
+    isSynthesis ||
+    normQuery.includes('so sanh') ||
+    normQuery.includes('phan tich') ||
+    normQuery.includes('vi sao') ||
+    normQuery.includes('tai sao') ||
+    normQuery.includes('khac nhau') ||
+    normQuery.includes('lien he') ||
+    normQuery.includes('vai tro') ||
+    normQuery.includes('gia tri');
+
   // Detect explicit non-Xoan heritage genres when NOT discussing Xoan
   const mentionsExternalGenre =
     (normQuery.includes('quan ho') ||
@@ -190,6 +202,7 @@ export function retrieveHeritageRecords(
         isAllHatHoi: false,
         isSynthesis: false,
         isCommunityOrLocation: false,
+        needsDeepReasoning: false,
       },
       matches: [],
       records: [],
@@ -457,6 +470,7 @@ export function retrieveHeritageRecords(
       isAllHatHoi,
       isSynthesis,
       isCommunityOrLocation,
+      needsDeepReasoning,
     },
     matches: finalMatches,
     records: finalRecords,
